@@ -12,6 +12,7 @@ import csv
 import io
 import os
 import uuid
+import threading
 from django.utils import timezone
 try:
     import fitz  # PyMuPDF
@@ -914,6 +915,101 @@ Only return valid JSON, no additional text."""
         raise Exception(f'AI generation failed: {str(e)}')
 
 
+def _generate_course_ai_content(course_id, course_name, description, course_type, coach_name):
+    """Background function to generate AI course content"""
+    try:
+        from django.db import connection
+        # Close any existing database connections before starting thread
+        connection.close()
+        
+        # Re-fetch course to ensure we have latest data
+        course = Course.objects.get(id=course_id)
+        
+        # Generate course structure with AI
+        course_structure, ai_client = generate_ai_course_structure(
+            course_name=course_name,
+            description=description,
+            course_type=course_type,
+            coach_name=coach_name
+        )
+        
+        # Create modules and lessons
+        modules_created = 0
+        lessons_created = 0
+        
+        for module_data in course_structure.get('modules', []):
+            module = Module.objects.create(
+                course=course,
+                name=module_data.get('name', 'Untitled Module'),
+                description=module_data.get('description', ''),
+                order=module_data.get('order', 0)
+            )
+            modules_created += 1
+            
+            # Create lessons for this module
+            for lesson_data in module_data.get('lessons', []):
+                lesson_title = lesson_data.get('title', 'Untitled Lesson')
+                lesson_description = lesson_data.get('description', '')
+                lesson_slug = generate_slug(lesson_title)
+                
+                # Ensure lesson slug is unique within course
+                base_lesson_slug = lesson_slug
+                lesson_counter = 1
+                while Lesson.objects.filter(course=course, slug=lesson_slug).exists():
+                    lesson_slug = f"{base_lesson_slug}-{lesson_counter}"
+                    lesson_counter += 1
+                
+                # Generate all AI lesson metadata (title, summary, description, outcomes, coach actions)
+                lesson_metadata = generate_ai_lesson_metadata(
+                    client=ai_client,
+                    lesson_title=lesson_title,
+                    lesson_description=lesson_description,
+                    course_name=course_name,
+                    course_type=course_type
+                )
+                
+                # Generate lesson content blocks using AI (Editor.js format)
+                lesson_content_sections = generate_ai_lesson_content(
+                    client=ai_client,
+                    lesson_title=lesson_title,
+                    lesson_description=lesson_description,
+                    course_name=course_name,
+                    course_type=course_type
+                )
+                
+                # Convert content sections to Editor.js format
+                lesson_content = create_editorjs_content(lesson_content_sections) if lesson_content_sections else {}
+                
+                Lesson.objects.create(
+                    course=course,
+                    module=module,
+                    title=lesson_title,
+                    slug=lesson_slug,
+                    description=lesson_description,
+                    order=lesson_data.get('order', 0),
+                    working_title=lesson_title,
+                    # AI-generated metadata fields
+                    ai_clean_title=lesson_metadata.get('clean_title', lesson_title),
+                    ai_short_summary=lesson_metadata.get('short_summary', ''),
+                    ai_full_description=lesson_metadata.get('full_description', lesson_description),
+                    ai_outcomes=lesson_metadata.get('outcomes', []),
+                    ai_coach_actions=lesson_metadata.get('coach_actions', []),
+                    # Editor.js content blocks
+                    content=lesson_content,
+                    ai_generation_status='generated'
+                )
+                lessons_created += 1
+        
+        # Log success (could also update a status field on Course model if needed)
+        print(f'[Background] Successfully generated AI content for course "{course_name}": {modules_created} modules, {lessons_created} lessons')
+        
+    except Exception as e:
+        # Log error (could also update a status field on Course model if needed)
+        print(f'[Background] Error generating AI content for course "{course_name}": {str(e)}')
+        import traceback
+        traceback.print_exc()
+
+
 @staff_member_required
 def dashboard_add_course(request):
     """Add new course with optional AI generation"""
@@ -945,94 +1041,22 @@ def dashboard_add_course(request):
             coach_name=coach_name,
         )
         
-        # Generate course structure with AI if requested
+        # Generate course structure with AI if requested (in background)
         if use_ai and description:
-            try:
-                course_structure, ai_client = generate_ai_course_structure(
-                    course_name=name,
-                    description=description,
-                    course_type=course_type,
-                    coach_name=coach_name
-                )
-                
-                # Create modules and lessons
-                modules_created = 0
-                lessons_created = 0
-                
-                for module_data in course_structure.get('modules', []):
-                    module = Module.objects.create(
-                        course=course,
-                        name=module_data.get('name', 'Untitled Module'),
-                        description=module_data.get('description', ''),
-                        order=module_data.get('order', 0)
-                    )
-                    modules_created += 1
-                    
-                    # Create lessons for this module
-                    for lesson_data in module_data.get('lessons', []):
-                        lesson_title = lesson_data.get('title', 'Untitled Lesson')
-                        lesson_description = lesson_data.get('description', '')
-                        lesson_slug = generate_slug(lesson_title)
-                        
-                        # Ensure lesson slug is unique within course
-                        base_lesson_slug = lesson_slug
-                        lesson_counter = 1
-                        while Lesson.objects.filter(course=course, slug=lesson_slug).exists():
-                            lesson_slug = f"{base_lesson_slug}-{lesson_counter}"
-                            lesson_counter += 1
-                        
-                        # Generate all AI lesson metadata (title, summary, description, outcomes, coach actions)
-                        lesson_metadata = generate_ai_lesson_metadata(
-                            client=ai_client,
-                            lesson_title=lesson_title,
-                            lesson_description=lesson_description,
-                            course_name=name,
-                            course_type=course_type
-                        )
-                        
-                        # Generate lesson content blocks using AI (Editor.js format)
-                        lesson_content_sections = generate_ai_lesson_content(
-                            client=ai_client,
-                            lesson_title=lesson_title,
-                            lesson_description=lesson_description,
-                            course_name=name,
-                            course_type=course_type
-                        )
-                        
-                        # Convert content sections to Editor.js format
-                        lesson_content = create_editorjs_content(lesson_content_sections) if lesson_content_sections else {}
-                        
-                        Lesson.objects.create(
-                            course=course,
-                            module=module,
-                            title=lesson_title,
-                            slug=lesson_slug,
-                            description=lesson_description,
-                            order=lesson_data.get('order', 0),
-                            working_title=lesson_title,
-                            # AI-generated metadata fields
-                            ai_clean_title=lesson_metadata.get('clean_title', lesson_title),
-                            ai_short_summary=lesson_metadata.get('short_summary', ''),
-                            ai_full_description=lesson_metadata.get('full_description', lesson_description),
-                            ai_outcomes=lesson_metadata.get('outcomes', []),
-                            ai_coach_actions=lesson_metadata.get('coach_actions', []),
-                            # Editor.js content blocks
-                            content=lesson_content,
-                            ai_generation_status='generated'
-                        )
-                        lessons_created += 1
-                
-                messages.success(
-                    request, 
-                    f'Course "{course.name}" created successfully with AI-generated content! '
-                    f'Created {modules_created} modules and {lessons_created} lessons with full content.'
-                )
-            except Exception as e:
-                messages.warning(
-                    request, 
-                    f'Course "{course.name}" created, but AI generation failed: {str(e)}. '
-                    'You can add modules and lessons manually.'
-                )
+            # Start background thread for AI generation
+            thread = threading.Thread(
+                target=_generate_course_ai_content,
+                args=(course.id, name, description, course_type, coach_name),
+                daemon=True
+            )
+            thread.start()
+            
+            messages.success(
+                request, 
+                f'Course "{course.name}" created successfully! AI content generation has started in the background. '
+                'Modules and lessons will be added automatically when generation completes. '
+                'This may take a few minutes - please refresh the course page to see updates.'
+            )
         else:
             messages.success(request, f'Course "{course.name}" has been created successfully.')
         
